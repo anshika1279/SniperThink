@@ -15,7 +15,7 @@ As per the constraints, **no managed voice platforms** (like LiveKit, VAPI, Pipe
   2. A Deepgram WebSocket Streaming connection (`stt.py`) for real-time transcription.
 
 - **The Voice Pipeline orchestration (`main.py`):**
-  The user speaks. `webrtcvad` yields `SPEECH_START` and `SPEECH_END`. When speech completes, the backend triggers an OpenAI `gpt-4o-mini` streaming API request.
+  The user speaks. `webrtcvad` yields `SPEECH_START` and `SPEECH_END`. When speech completes, the backend triggers a Google Gemini (e.g. `gemini-2.0-flash`) streaming API request.
   As text tokens rapidly yield, they are immediately funneled into ElevenLabs `WebSockets` TTS Endpoint, which immediately returns PCM `Int16` audio chunks down the same WebSocket back to the browser.
   
 ## 2. Design Decisions
@@ -47,18 +47,18 @@ transport, session management, turn-taking logic, audio
 streaming, pipeline orchestration, and interruption handling —
 is implemented manually.
 
-External APIs (Deepgram, OpenAI, ElevenLabs) are used only
+External APIs (Deepgram, Google Gemini, ElevenLabs) are used only
 for model inference (STT/LLM/TTS).
 
 ## Setup Instructions
 
 1. `cd backend`
 2. Duplicate `.env.example` (or set up `.env`) with:
-    - `OPENAI_API_KEY=`
+    - `GEMINI_API_KEY=`
     - `DEEPGRAM_API_KEY=`
     - `ELEVENLABS_API_KEY=`
 3. Run `python -m venv venv`
 4. Source `venv/bin/activate` or `venv\Scripts\activate` on Windows
-5. `pip install fastapi uvicorn websockets webrtcvad python-multipart python-dotenv openai deepgram-sdk elevenlabs`
+5. `pip install fastapi uvicorn websockets webrtcvad python-multipart python-dotenv google-genai deepgram-sdk elevenlabs`
 6. `uvicorn main:app --reload`
 7. Open your browser to `http://localhost:8000/client/index.html`
