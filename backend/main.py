@@ -82,12 +82,14 @@ class ConversationSession:
         while True:
             try:
                 text = await self.stt.get_transcript()
-                if self.user_is_speaking:
-                    self.accumulated_transcript += " " + text
-                else:
-                    self.accumulated_transcript += " " + text
-                    # Could optionally trigger AI response early depending on logic
+                self.accumulated_transcript += " " + text
+
+                # If SPEECH_END already fired before this transcript arrived,
+                # trigger AI now (fixes the VAD/STT race condition).
+                if not self.user_is_speaking:
+                    await self.trigger_ai_response()
             except Exception as e:
+                print(f"[STT Listener] Error: {e}")
                 break
                 
     async def interrupt_ai(self):
@@ -128,6 +130,12 @@ class ConversationSession:
 
     async def run_ai_pipeline(self, user_text: str):
         try:
+            # ElevenLabs closes the WS after isFinal each turn — must reconnect
+            await self.tts.disconnect()
+            tts_online = await self.tts.connect()
+            if not tts_online:
+                print("[TTS] Failed to reconnect — skipping audio for this turn.")
+
             ai_text_full = ""
             
             # Send context to LLM
@@ -154,8 +162,12 @@ class ConversationSession:
             # Signal end of text to TTS
             await self.tts.flush()
             
-            # Wait for all audio to be generated and sent
-            await tts_recv_task
+            # Wait for all audio to be received and forwarded (with safety timeout)
+            try:
+                await asyncio.wait_for(tts_recv_task, timeout=20.0)
+            except asyncio.TimeoutError:
+                print("[TTS] Receiver timed out after 20s — skipping remaining audio")
+                tts_recv_task.cancel()
             
             self.context.append({"role": "user", "content": user_text})
             self.context.append({"role": "assistant", "content": ai_text_full})

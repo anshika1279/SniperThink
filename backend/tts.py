@@ -1,7 +1,7 @@
 import os
+import asyncio
 import json
 import base64
-import asyncio
 import websockets
 from dotenv import load_dotenv
 
@@ -53,9 +53,20 @@ class ElevenLabsTTS:
             
         try:
             while True:
-                response = await self.ws.recv()
+                try:
+                    # Timeout so we never hang if ElevenLabs stops sending
+                    response = await asyncio.wait_for(self.ws.recv(), timeout=8.0)
+                except asyncio.TimeoutError:
+                    print("[TTS] recv timeout — assuming stream ended")
+                    break
+
                 data = json.loads(response)
-                
+
+                # Handle ElevenLabs error messages
+                if data.get("error"):
+                    print(f"[TTS] ElevenLabs error: {data['error']}")
+                    break
+
                 if data.get("audio"):
                     audio_b64 = data["audio"]
                     yield base64.b64decode(audio_b64)
