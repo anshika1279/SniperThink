@@ -1,5 +1,4 @@
 import os
-import asyncio
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -23,7 +22,7 @@ def _pick_best_model(client: genai.Client) -> str:
     """
     try:
         available = [m.name for m in client.models.list()]
-        # Try preferred models first (strip 'models/' prefix for comparison)
+        # Try preferred models first
         for preferred in PREFERRED_MODELS:
             for name in available:
                 if preferred in name and "audio" not in name:
@@ -54,7 +53,15 @@ class LLMStreamer:
 
     async def generate_response(self, text: str, context: list):
         """
-        Async generator that yields text tokens from Gemini streaming.
+        True async generator that yields text tokens from Gemini one-by-one
+        as they arrive, using the native async streaming API.
+
+        Using client.aio.models.generate_content_stream() is critical — it
+        returns an AsyncIterator that yields each chunk the moment Gemini
+        sends it, allowing us to pipeline tokens directly into ElevenLabs TTS
+        without waiting for the full response. This minimises TTFB by ~1-2s
+        compared to collecting the entire response first.
+
         context: list of {"role": "user"|"assistant", "content": "..."} dicts.
         """
         history = []
@@ -72,18 +79,14 @@ class LLMStreamer:
         ]
 
         try:
-            # generate_content_stream is synchronous — run in a thread pool
-            # to avoid blocking the async event loop.
-            chunks = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: list(
-                    self.client.models.generate_content_stream(
-                        model=self.model_id,
-                        contents=contents,
-                    )
-                ),
-            )
-            for chunk in chunks:
+            # client.aio is the async namespace of the google-genai SDK.
+            # generate_content_stream returns an AsyncIterator — each chunk
+            # is yielded the instant Gemini streams it over the network,
+            # with no buffering or blocking of the event loop.
+            async for chunk in await self.client.aio.models.generate_content_stream(
+                model=self.model_id,
+                contents=contents,
+            ):
                 if chunk.text:
                     yield chunk.text
 

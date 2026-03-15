@@ -5,6 +5,8 @@ let websocket = null;
 
 let isPlaying = false;
 let audioQueue = [];
+let activeSources = [];   // Track every BufferSource node that has been started
+let isAISpeaking = false; // True while AI audio is being streamed/played
 let nextStartTime = 0;
 let checkQueueTimer = null;
 let audioGate = true; // false = drop incoming audio (AI was interrupted)
@@ -54,15 +56,19 @@ function connectWebSocket() {
                 try {
                     const data = JSON.parse(event.data);
                     if (data.type === 'clear') {
-                        // User interrupted — close gate so stale audio is dropped
+                        // User interrupted — stop all playing audio immediately
                         audioGate = false;
+                        isAISpeaking = false;
                         clearPlaybackQueue();
                         updateStatus('Listening...');
                     } else if (data.type === 'transcript') {
                         appendTranscript(data.text, data.speaker); // speaker = 'user' or 'ai'
                     } else if (data.type === 'status') {
                         if (data.status === 'AI thinking...') {
-                            audioGate = true; // new turn — allow audio again
+                            audioGate = true;  // new turn — allow audio again
+                            isAISpeaking = false;
+                        } else if (data.status === 'Ready') {
+                            isAISpeaking = false;
                         }
                         updateStatus(data.status);
                     }
@@ -70,6 +76,7 @@ function connectWebSocket() {
             } else {
                 // Binary Data (Audio from AI) — drop if gate is closed (interrupted)
                 if (!audioGate) return;
+                isAISpeaking = true;
                 const audioData = new Int16Array(event.data);
                 queueAudio(audioData);
             }
@@ -84,8 +91,14 @@ function connectWebSocket() {
 
 // Playback Logic
 function clearPlaybackQueue() {
+    // Stop every BufferSource node that is currently scheduled or playing.
+    // Clearing the queue alone does NOT stop nodes already started on the AudioContext.
+    activeSources.forEach(src => {
+        try { src.stop(); } catch(e) { /* already stopped */ }
+    });
+    activeSources = [];
     audioQueue = [];
-    nextStartTime = audioContext.currentTime;
+    nextStartTime = audioContext ? audioContext.currentTime : 0;
 }
 
 function queueAudio(pcm16Data) {
@@ -109,7 +122,16 @@ function queueAudio(pcm16Data) {
     source.buffer = audioBuffer;
     source.connect(audioContext.destination);
     source.start(nextStartTime);
-    
+
+    // Track the source so we can stop it immediately on interrupt
+    activeSources.push(source);
+    source.onended = () => {
+        const idx = activeSources.indexOf(source);
+        if (idx !== -1) activeSources.splice(idx, 1);
+        // If nothing left playing, mark AI as silent
+        if (activeSources.length === 0) isAISpeaking = false;
+    };
+
     nextStartTime += audioBuffer.duration;
 }
 
@@ -131,6 +153,24 @@ async function startAudioCapture() {
 
     processor.port.onmessage = (e) => {
         if (websocket && websocket.readyState === WebSocket.OPEN) {
+            // If the AI is currently speaking and the mic is picking up audio,
+            // send a lightweight JSON interrupt ping to the backend immediately.
+            // This lets the server cancel the LLM/TTS pipeline before the VAD
+            // round-trip even completes, reducing perceived interruption latency.
+            if (isAISpeaking) {
+                const pcm = new Int16Array(e.data);
+                // Only trigger if the chunk has meaningful energy (avoid noise)
+                let energy = 0;
+                for (let i = 0; i < pcm.length; i++) energy += Math.abs(pcm[i]);
+                const avgEnergy = energy / pcm.length;
+                if (avgEnergy > 500) { // ~1.5% of max Int16 — tunable threshold
+                    websocket.send(JSON.stringify({ type: 'interrupt' }));
+                    isAISpeaking = false; // Debounce — don't spam the server
+                    audioGate = false;
+                    clearPlaybackQueue();
+                    updateStatus('Listening...');
+                }
+            }
             websocket.send(e.data); // Int16Array ArrayBuffer
         }
     };

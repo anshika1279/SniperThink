@@ -1,64 +1,158 @@
 # Real-Time Voice Conversation Architecture
 
-This project is a raw implementation of a low-latency, bidirectional real-time voice AI system built purely from foundational primitives (FastAPI, WebSockets, WebRTC VAD, AudioWorklets, streaming STT and token-level streaming TTS). 
+This project is a low-latency, bidirectional real-time voice AI system built from foundational primitives: FastAPI, WebSockets, WebRTC VAD, AudioWorklets, streaming STT, and token-level streaming TTS.
 
-As per the constraints, **no managed voice platforms** (like LiveKit, VAPI, Pipecat, etc.) were used to orchestrate the pipeline.
+No managed voice orchestration platforms (LiveKit, VAPI, Pipecat, Retell, etc.) are used.
 
 ## 1. Architecture
 
-- **Frontend (Browser):**
-  Uses the modern and non-deprecated WebAudio `AudioWorkletNode` via `audio-processor.js` to continuously capture microphone data as `Float32` PCM without the main thread stuttering. It transposes the buffers into `Int16` 16kHz frames and streams them over a persistent WebSocket connection natively.
-  
-- **Backend (Python FastAPI):**
-  A robust asynchronous WebSocket gateway that pipes incoming binary chunks simultaneously into:
-  1. A `webrtcvad` (WebRTC) loop sliced into 30ms frames for precise turn-detection.
-  2. A Deepgram WebSocket Streaming connection (`stt.py`) for real-time transcription.
+- **Frontend (Browser)**
+Uses `AudioWorkletNode` in `frontend/audio-processor.js` to capture microphone audio continuously without blocking the UI thread. Audio is converted to `Int16` PCM (16kHz) and streamed over a persistent WebSocket. Playback is chunked and interruptible.
 
-- **The Voice Pipeline orchestration (`main.py`):**
-  The user speaks. `webrtcvad` yields `SPEECH_START` and `SPEECH_END`. When speech completes, the backend triggers a Google Gemini (e.g. `gemini-2.0-flash`) streaming API request.
-  As text tokens rapidly yield, they are immediately funneled into ElevenLabs `WebSockets` TTS Endpoint, which immediately returns PCM `Int16` audio chunks down the same WebSocket back to the browser.
-  
-## 2. Design Decisions
+- **Backend (FastAPI + WebSocket)**
+`backend/main.py` manages each conversation session and routes incoming audio to:
+1. `VADAnalyzer` (`backend/vad.py`) for turn detection (`SPEECH_START` / `SPEECH_END`).
+2. `DeepgramSTT` (`backend/stt.py`) for live transcription.
 
-- **Token-Level TTS over WebSockets**: The user challenged the batch TTS approach. We've opted into an ElevenLabs pure-streaming WS implementation (`tts.py`). Token-by-token streaming is achieved by pipelining LLM tokens into the WS, reducing Time-To-First-Byte (TTFB) significantly.
-- **WebRTC VAD over RMS**: VAD endpoint detection utilizes `webrtcvad` giving high-quality, aggressive silence gap evaluation avoiding false detections on background noise.
-- **AudioWorklets over ScriptProcessorNode**: Implemented proper Web Audio context processor yielding a true 16kHz reliable sample stream avoiding WebAPI deprecations.
+- **Voice Pipeline**
+After user speech ends, transcript text is sent to the LLM module (`backend/llm.py`). LLM tokens are streamed immediately into `ElevenLabsTTS` (`backend/tts.py`), and synthesized PCM audio is streamed back to the browser in real time.
 
-## 3. Latency Considerations
+## 2. LLM Provider Options
 
-- **Streaming Every Step**: The system incurs practically zero batching.
-    - User audio chunks → STT WebSocket streams.
-    - Interim partials / final STT → LLM generation.
-    - LLM Token chunks → TTS WebSocket Text Streaming.
-    - TTS Audio WebSocket Chunks → Browser Playback Buffer.
-  This allows overlapping network I/O bounds rather than sequential request bounds, cutting total theoretical latency from ~2-3 seconds down to under ~500-800ms.
+This repository currently runs on Gemini by default. Ollama is included as a documented local alternative path.
 
-## 4. Known Trade-Offs
+### Option A: Gemini (Cloud)
 
-- **No Dedicated Jitter Buffer**: The frontend simply plays chunks with a minimal delay `0.05` offset. In a heavily congested network, playback might pop or crack if frames arrive late. A professional WebRTC architecture provides explicit packet jitter buffering.
-- **VAD Turn Interruption Delay**: While `SPEECH_START` instantly sends a `clear` command to the UI, there's inherently a round-trip delay from the STT understanding the interruption vs. dropping current processing. It stops the LLM/TTS immediately from consuming more credits upon detection.
+- Best for: strongest model quality and cloud-hosted inference.
+- Current repository status: this is the default implementation already wired in `backend/llm.py`.
+- Required env key: `GEMINI_API_KEY`.
 
-## 5. No Managed Platforms
-This system does not rely on any managed voice orchestration
-platforms such as LiveKit, Retell, VAPI, Pipecat, or similar.
+Flow:
+`Transcript -> Gemini streaming API -> token stream -> ElevenLabs TTS`
 
-All core real-time voice infrastructure — including WebSocket
-transport, session management, turn-taking logic, audio
-streaming, pipeline orchestration, and interruption handling —
-is implemented manually.
+### Option B: Ollama (Local)
 
-External APIs (Deepgram, Google Gemini, ElevenLabs) are used only
-for model inference (STT/LLM/TTS).
+- Best for: local/private inference, offline-friendly development, and avoiding LLM per-token cloud cost.
+- Current repository status: not implemented in `backend/llm.py` yet; add it by extending `LLMStreamer`.
+- Typical local endpoint: `http://localhost:11434`.
+- Example local models: `llama3.1:8b`, `qwen2.5:7b`.
 
-## Setup Instructions
+Flow:
+`Transcript -> Ollama local streaming API -> token stream -> ElevenLabs TTS`
+
+To use Ollama in this project, replace or extend `LLMStreamer` in `backend/llm.py` so `generate_response()` streams from Ollama instead of Gemini while keeping the same async token-yield contract used by `main.py`.
+
+Current behavior in code:
+- `ConversationSession` always instantiates `LLMStreamer()` from `backend/llm.py`.
+- `LLMStreamer` currently uses `google-genai` streaming only.
+
+## 3. Design Decisions
+
+- **Token-level pipeline**
+LLM output is streamed token-by-token and forwarded directly to TTS to reduce first-audio latency.
+
+- **Dual interruption path with hard teardown**
+Interrupts are detected both server-side (WebRTC VAD events) and client-side (mic energy threshold while AI audio is playing). Frontend sends `{"type":"interrupt"}` immediately.
+
+`backend/main.py` uses a shared `_teardown_pipeline()` path that:
+- increments a generation counter (`gen_id`) so older pipelines self-terminate,
+- disconnects ElevenLabs WebSocket immediately,
+- cancels and awaits both AI and TTS receiver tasks.
+
+This ensures stale audio is not sent after an interrupt or rapid turn switch.
+
+- **WebRTC VAD over basic RMS-only thresholding**
+`webrtcvad` improves turn-taking robustness in noisy conditions.
+
+- **AudioWorklet over deprecated ScriptProcessorNode**
+Gives stable low-latency capture and better thread separation.
+
+## 4. Latency Considerations
+
+Each stage is streamed continuously, not batched:
+
+- Mic PCM chunks -> backend WebSocket
+- PCM chunks -> Deepgram streaming STT
+- Final transcript -> streaming LLM generation
+- LLM tokens -> ElevenLabs streaming TTS
+- TTS audio chunks -> browser playback queue
+
+Additionally, interruption latency is reduced by:
+- client-side early interrupt JSON event,
+- server-side VAD confirmation,
+- `gen_id` stale-pipeline checks before token/audio forwarding.
+
+This overlap of network and compute stages significantly reduces perceived response latency.
+
+## 5. Known Trade-Offs
+
+- **No full jitter buffer implementation**
+Very poor networks may introduce playback pops.
+
+- **TTS startup floor**
+ElevenLabs model behavior adds a small startup delay before first audio.
+
+- **RAG is a PoC module**
+`backend/rag.py` is keyword-based; production RAG should use vector retrieval.
+
+- **Gemini vs Ollama trade-off**
+Gemini generally gives stronger output quality and consistency; Ollama gives local control/privacy but quality and speed depend on local hardware/model.
+
+- **Ollama requires code integration**
+README documents Ollama flow, but runtime provider switching is not wired in current code yet.
+
+## 6. No Managed Platforms
+
+All transport, sessioning, turn-taking, interruption handling, and streaming orchestration are implemented directly in this codebase.
+
+External services are used only for model inference.
+
+## 7. Setup
+
+### Common setup
 
 1. `cd backend`
-2. Duplicate `.env.example` (or set up `.env`) with:
-    - `GEMINI_API_KEY=`
-    - `DEEPGRAM_API_KEY=`
-    - `ELEVENLABS_API_KEY=`
-3. Run `python -m venv venv`
-4. Source `venv/bin/activate` or `venv\Scripts\activate` on Windows
-5. `pip install fastapi uvicorn websockets webrtcvad python-multipart python-dotenv google-genai deepgram-sdk elevenlabs`
-6. `uvicorn main:app --reload`
-7. Open your browser to `http://localhost:8000/client/index.html`
+2. Create and activate a virtual environment.
+3. Install dependencies:
+  `pip install fastapi uvicorn websockets webrtcvad python-multipart python-dotenv google-genai deepgram-sdk`
+4. Copy env template:
+  Windows PowerShell: `Copy-Item .env.example .env`
+  Mac/Linux: `cp .env.example .env`
+
+### Run with Gemini (cloud, default)
+
+Set these in `backend/.env`:
+
+- `GEMINI_API_KEY=...`
+- `DEEPGRAM_API_KEY=...`
+- `ELEVENLABS_API_KEY=...`
+
+Start server:
+`uvicorn main:app --reload`
+
+Open:
+`http://localhost:8000/client/index.html`
+
+### Run with Ollama (local LLM alternative)
+
+1. Install Ollama and pull a model:
+  - `ollama pull llama3.1:8b`
+2. Start Ollama service locally.
+3. Update `backend/llm.py` to stream from Ollama (manual code change; no runtime switch is implemented yet).
+4. Keep using existing STT/TTS keys in `.env`:
+  - `DEEPGRAM_API_KEY=...`
+  - `ELEVENLABS_API_KEY=...`
+5. Start server:
+  - `uvicorn main:app --reload`
+
+## 8. Future Option: Provider Switch (Not Implemented)
+
+If you later want both options selectable at runtime, you can add:
+
+- `LLM_PROVIDER=gemini` or `LLM_PROVIDER=ollama`
+- `OLLAMA_BASE_URL=http://localhost:11434`
+- `OLLAMA_MODEL=llama3.1:8b`
+
+Then instantiate the appropriate provider in `backend/llm.py` while preserving the same async streaming interface.
+
+Current repository behavior: Gemini path is implemented; provider switching is documentation-only at this stage.
