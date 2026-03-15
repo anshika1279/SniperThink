@@ -34,6 +34,7 @@ class ConversationSession:
         self.context = []
         self.user_is_speaking = False
         self.ai_task_group = None
+        self.tts_recv_task = None  # tracked separately so interrupt_ai() can cancel it
         self.accumulated_transcript = ""
 
     async def start(self):
@@ -93,10 +94,16 @@ class ConversationSession:
                 break
                 
     async def interrupt_ai(self):
-        # Cancel active LLM/TTS pipeline
+        # Cancel the LLM/TTS pipeline task
         if self.ai_task_group and not self.ai_task_group.done():
             self.ai_task_group.cancel()
-            
+
+        # CRITICAL: tts_recv_task is an independent asyncio task — cancelling
+        # ai_task_group does NOT stop it. Cancel explicitly so old audio stops.
+        if self.tts_recv_task and not self.tts_recv_task.done():
+            self.tts_recv_task.cancel()
+            self.tts_recv_task = None
+
         try:
             await self.ws.send_text(json.dumps({"type": "clear"}))
             await self.ws.send_text(json.dumps({"type": "status", "status": "User speaking..."}))
@@ -149,7 +156,7 @@ class ConversationSession:
                     except Exception:
                         break
 
-            tts_recv_task = asyncio.create_task(tts_receiver())
+            self.tts_recv_task = asyncio.create_task(tts_receiver())
             
             # Stream tokens from LLM directly into TTS WebSocket
             print("[LLM] Starting generation...")
@@ -164,10 +171,10 @@ class ConversationSession:
             
             # Wait for all audio to be received and forwarded (with safety timeout)
             try:
-                await asyncio.wait_for(tts_recv_task, timeout=20.0)
+                await asyncio.wait_for(self.tts_recv_task, timeout=20.0)
             except asyncio.TimeoutError:
                 print("[TTS] Receiver timed out after 20s — skipping remaining audio")
-                tts_recv_task.cancel()
+                self.tts_recv_task.cancel()
             
             self.context.append({"role": "user", "content": user_text})
             self.context.append({"role": "assistant", "content": ai_text_full})

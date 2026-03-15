@@ -7,6 +7,7 @@ let isPlaying = false;
 let audioQueue = [];
 let nextStartTime = 0;
 let checkQueueTimer = null;
+let audioGate = true; // false = drop incoming audio (AI was interrupted)
 
 const btnStart = document.getElementById('btn-start');
 const btnStop = document.getElementById('btn-stop');
@@ -53,17 +54,22 @@ function connectWebSocket() {
                 try {
                     const data = JSON.parse(event.data);
                     if (data.type === 'clear') {
-                        // User started speaking, interrupt AI
+                        // User interrupted — close gate so stale audio is dropped
+                        audioGate = false;
                         clearPlaybackQueue();
                         updateStatus('Listening...');
                     } else if (data.type === 'transcript') {
                         appendTranscript(data.text, data.speaker); // speaker = 'user' or 'ai'
                     } else if (data.type === 'status') {
+                        if (data.status === 'AI thinking...') {
+                            audioGate = true; // new turn — allow audio again
+                        }
                         updateStatus(data.status);
                     }
                 } catch(e) { console.error("Error parsing message", e); }
             } else {
-                // Binary Data (Audio from AI)
+                // Binary Data (Audio from AI) — drop if gate is closed (interrupted)
+                if (!audioGate) return;
                 const audioData = new Int16Array(event.data);
                 queueAudio(audioData);
             }
