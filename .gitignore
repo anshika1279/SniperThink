@@ -34,3 +34,5 @@ Thumbs.db
 
 # Frontend dependency folders
 node_modules/
+
+requirements.md
